@@ -1,0 +1,323 @@
+stages:
+- build
+- provision
+- deploy
+- cleanup
+
+.aws_environments: &aws_environments
+  AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+  AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+  ECR_REGISTRY_IMAGE: $ECR_REGISTRY_IMAGE
+  NGINX_STACK_PREFIX: ec2-nginx
+  
+.build_template: &build_template
+  stage: build
+  image: docker:latest
+  variables:
+    <<: *aws_environments
+    TARGET_HOST: google.com
+    RESOLVER_IP: 8.8.8.8
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  services:
+  - docker:dind
+
+qualities_test:
+  stage: build
+  image: python:3.7
+  before_script:
+  - pip3 install pipenv
+  - cd cdk
+  - pipenv install --system --dev
+  script:
+  - black .
+  - flake8 .
+  - mypy --config ./setup.cfg .
+  except:
+  - tags
+
+dev_build:
+  <<: *build_template
+  before_script:
+  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+  - cd docker
+  - docker pull $CI_REGISTRY_IMAGE:latest || true
+  - >
+    docker build
+    --cache-from $CI_REGISTRY_IMAGE:latest
+    --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+  - >
+    docker run
+    -e TARGET_HOST=$TARGET_HOST
+    -e RESOLVER_IP=$RESOLVER_IP
+    $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    nginx -T
+  except:
+  - master
+  - tags
+
+master_build:
+  <<: *build_template
+  before_script:
+  - apk update && apk add python3
+  - pip3 install awscli
+  - eval $(aws ecr get-login --no-include-email);
+  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY  
+  script:
+  - cd docker
+  - docker pull $CI_REGISTRY_IMAGE:latest || true
+  - >
+    docker build
+    --cache-from $CI_REGISTRY_IMAGE:latest
+    --tag $CI_REGISTRY_IMAGE:latest
+    --tag $ECR_REGISTRY_IMAGE:latest .
+  - >
+    docker run
+    -e TARGET_HOST=$TARGET_HOST
+    -e RESOLVER_IP=$RESOLVER_IP
+    $CI_REGISTRY_IMAGE:latest
+    nginx -T  
+  - docker push $CI_REGISTRY_IMAGE:latest
+  - docker push $ECR_REGISTRY_IMAGE:latest
+  only:
+  - master
+
+release_build:
+  <<: *build_template
+  before_script:
+  - apk update && apk add python3
+  - pip3 install awscli
+  - eval $(aws ecr get-login --no-include-email);
+  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+  - cd docker
+  - docker pull $CI_REGISTRY_IMAGE:latest || true
+  - >
+    docker build
+    --cache-from $CI_REGISTRY_IMAGE:latest
+    --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
+    --tag $ECR_REGISTRY_IMAGE:$CI_COMMIT_TAG .
+  - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
+  - docker push $ECR_REGISTRY_IMAGE:$CI_COMMIT_TAG
+  only:
+  - tags
+
+.provision_template: &provision_template
+  stage: provision
+  image: python:3.7
+  before_script:
+  - apt update
+  - apt install -y nodejs npm
+  - pip3 install pipenv
+  - cd cdk
+  - npm install -g aws-cdk
+  - pipenv install --system
+  script:
+  - cdk deploy
+
+master_provision:
+  <<: *provision_template
+  variables:
+    <<: *aws_environments
+    ENVIRONMENT: dev
+  only:
+  - master
+
+release_provision:
+  <<: *provision_template
+  variables:
+    <<: *aws_environments
+    ENVIRONMENT: prod
+  only:
+  - tags
+
+.deploy_template: &deploy_template
+  stage: deploy
+  image: python:3.7
+  before_script:
+  - apt update
+  - pip3 install awscli
+  script:
+  - >
+    ALLOCATION_ID=$(
+    aws ec2 describe-addresses
+    --public-ips ${NGINX_ELASTIC_IP}
+    --query Addresses[].AllocationId 
+    --output text
+    );
+    NEW_NGINX_INSTANCE_ID=$(
+    aws cloudformation describe-stacks
+    --stack-name ${NEW_STACK_NAME}
+    --query "Stacks[0].Outputs[?OutputKey=='NginxInstanceId'].OutputValue"
+    --output text
+    );
+    NEW_NGINX_TARGETGROUP_ARN=$(
+    aws cloudformation describe-stacks
+    --stack-name ${NEW_STACK_NAME}
+    --query "Stacks[0].Outputs[?OutputKey=='NginxTargetGroupArn'].OutputValue"
+    --output text
+    );
+  - >
+    aws ec2 associate-address
+    --instance-id ${NEW_NGINX_INSTANCE_ID}
+    --allocation-id ${ALLOCATION_ID}
+    --allow-reassociation &&
+    aws elbv2 modify-listener
+    --listener-arn ${NGINX_ALB_LISTENER_ARN}
+    --default-actions Type=forward,TargetGroupArn=${NEW_NGINX_TARGETGROUP_ARN}
+
+master_deploy:
+  <<: *deploy_template
+  variables:
+    <<: *aws_environments
+    NGINX_ELASTIC_IP: $NGINX_ELASTIC_IP_DEV
+    NGINX_ALB_LISTENER_ARN: $NGINX_ALB_LISTENER_ARN_DEV
+    NEW_STACK_NAME: ${NGINX_STACK_PREFIX}-${CI_COMMIT_SHA}
+  when: manual
+  allow_failure: false
+  only:
+  - master
+
+release_deploy:
+  <<: *deploy_template
+  variables:
+    <<: *aws_environments
+    NGINX_ELASTIC_IP: $NGINX_ELASTIC_IP_PROD
+    NGINX_ALB_LISTENER_ARN: $NGINX_ALB_LISTENER_ARN_PROD
+    NEW_STACK_NAME: ${NGINX_STACK_PREFIX}-${CI_COMMIT_TAG}
+  when: manual
+  allow_failure: false
+  only:
+  - tags
+
+.cleanup_template: &cleanup_template
+  stage: cleanup
+  image: python:3.7
+  before_script:
+  - apt update
+  - pip3 install awscli
+
+# if deploying is succeeded, delete old stack and modify eip tag.
+.cleanup_old_script: &cleanup_old_script
+# get old stack name
+- >
+  ALLOCATION_ID=$(
+  aws ec2 describe-addresses
+  --public-ips ${NGINX_ELASTIC_IP}
+  --query Addresses[].AllocationId 
+  --output text
+  );
+  OLD_STACK_NAME=$(
+  aws ec2 describe-tags
+  --filter "Name=key,Values=AssociateStackName"
+  --query "Tags[?ResourceId=='$ALLOCATION_ID'].Value"
+  --output text
+  )
+# delete old stack
+- |
+  if [ -n "$OLD_STACK_NAME" ] ; then
+    aws cloudformation delete-stack --stack-name ${OLD_STACK_NAME}
+  fi
+# add new stack name tag to eip
+- >
+  aws ec2 delete-tags
+  --resources ${ALLOCATION_ID}
+  --tags Key=AssociateStackName ;
+  aws ec2 create-tags
+  --resources ${ALLOCATION_ID} 
+  --tags Key=AssociateStackName,Value=${NEW_STACK_NAME}
+
+# if deploying is failed, recover eip direction and
+# listener default target group, then delete new stack.
+.cleanup_new_script: &cleanup_new_script
+# get old stack name
+- >
+  ALLOCATION_ID=$(
+  aws ec2 describe-addresses
+  --public-ips ${NGINX_ELASTIC_IP}
+  --query Addresses[].AllocationId 
+  --output text
+  );
+  OLD_STACK_NAME=$(
+  aws ec2 describe-tags
+  --filter "Name=key,Values=AssociateStackName"
+  --query "Tags[?ResourceId=='$ALLOCATION_ID'].Value"
+  --output text
+  );
+- >
+  OLD_NGINX_INSTANCE_ID=$(
+  aws cloudformation describe-stacks
+  --stack-name ${OLD_STACK_NAME}
+  --query "Stacks[0].Outputs[?OutputKey=='NginxInstanceId'].OutputValue"
+  --output text
+  );
+  OLD_NGINX_TARGETGROUP_ARN=$(
+  aws cloudformation describe-stacks
+  --stack-name ${OLD_STACK_NAME}
+  --query "Stacks[0].Outputs[?OutputKey=='NginxTargetGroupArn'].OutputValue"
+  --output text
+  );
+- >
+  aws ec2 associate-address
+  --instance-id ${OLD_NGINX_INSTANCE_ID}
+  --allocation-id ${ALLOCATION_ID}
+  --allow-reassociation ;
+  aws elbv2 modify-listener
+  --listener-arn ${NGINX_ALB_LISTENER_ARN}
+  --default-actions Type=forward,TargetGroupArn=${OLD_NGINX_TARGETGROUP_ARN}
+- |
+  aws cloudformation describe-stacks --stack-name ${NEW_STACK_NAME} 2>&1 | grep "does not exist"
+  if [ $? -eq 0 ]; then
+    echo "cleanup target does not exist."
+  else
+    aws cloudformation delete-stack --stack-name ${NEW_STACK_NAME}
+  fi
+
+master_cleanup_old:
+  <<: *cleanup_template
+  variables:
+    <<: *aws_environments
+    NGINX_ELASTIC_IP: $NGINX_ELASTIC_IP_DEV
+    NEW_STACK_NAME: ${NGINX_STACK_PREFIX}-${CI_COMMIT_SHA}
+  script: *cleanup_old_script
+  when: on_success
+  only:
+  - master
+
+master_cleanup_new:
+  <<: *cleanup_template
+  variables:
+    <<: *aws_environments
+    NGINX_ELASTIC_IP: $NGINX_ELASTIC_IP_DEV
+    NGINX_ALB_LISTENER_ARN: $NGINX_ALB_LISTENER_ARN_DEV
+    NEW_STACK_NAME: ${NGINX_STACK_PREFIX}-${CI_COMMIT_SHA}
+  script: *cleanup_new_script
+  when: on_failure
+  only:
+  - master
+
+release_cleanup_old:
+  <<: *cleanup_template
+  variables:
+    <<: *aws_environments
+    NGINX_ELASTIC_IP: $NGINX_ELASTIC_IP_PROD
+    NEW_STACK_NAME: ${NGINX_STACK_PREFIX}-${CI_COMMIT_TAG}
+  script: *cleanup_old_script
+  when: on_success
+  only:
+  - tags
+
+release_cleanup_new:
+  <<: *cleanup_template
+  variables:
+    <<: *aws_environments
+    NGINX_ELASTIC_IP: $NGINX_ELASTIC_IP_PROD
+    NGINX_ALB_LISTENER_ARN: $NGINX_ALB_LISTENER_ARN_PROD
+    NEW_STACK_NAME: ${NGINX_STACK_PREFIX}-${CI_COMMIT_TAG}
+  script: *cleanup_new_script
+  when: on_failure
+  only:
+  - tags

@@ -1,0 +1,22 @@
+upstream target_system {
+    server $TARGET_HOST:443;
+}
+
+server {
+    access_log  /var/log/nginx/access.log;
+    error_log  /var/log/nginx/error.log;
+    listen       80 default_server;
+    include /etc/nginx/mime.types;
+
+    location = /healthcheck.html {
+        empty_gif;
+        access_log off;
+        break;
+    }
+
+    location / {
+        resolver $RESOLVER_IP;
+        proxy_set_header Host $TARGET_HOST;
+        proxy_pass https://target_system;
+    }
+}

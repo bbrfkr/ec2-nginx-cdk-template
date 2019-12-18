@@ -1,0 +1,41 @@
+block_device_mappings:
+- deviceName: "/dev/xvda"
+  ebs:
+    volumeSize: 20
+network_interfaces:
+- associatePublicIpAddress: true
+  deviceIndex: "0"
+  groupSet:
+  - sg-xxxxxxxxxxxxxxxxx
+  subnetId: subnet-xxxxxxxx
+iam_instance_profile:
+image_id: ami-0ff21806645c5e492
+instance_type: t3.micro
+key_name: ec2-nginx
+tags:
+- key: Name
+  value: ec2-nginx-dev
+tg_vpc_id: vpc-xxxxxxxx
+tg_protocol: HTTP
+tg_port: 80
+tg_healthcheck_protocol: HTTP
+tg_healthcheck_path: /healthcheck.html
+tg_health_check_timeout_seconds: 5
+tg_health_check_interval_seconds: 30
+tg_healthy_threshold_count: 2
+tg_unhealthy_threshold_count: 5
+tg_matcher:
+  httpCode: "200"
+tg_tags:
+- key: Name
+  value: ec2-nginx-tg-dev
+tg_target_group_attributes:
+- key: "deregistration_delay.timeout_seconds"
+  value: "30"
+- key: "slow_start.duration_seconds"
+  value: "0"
+- key: "stickiness.enabled"
+  value: "false"
+tg_target_port: 80
+nginx_target_host: www.target-domain
+nginx_resolver_ip: xxx.xxx.xxx.xxx

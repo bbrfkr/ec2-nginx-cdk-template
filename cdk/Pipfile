@@ -1,0 +1,25 @@
+[[source]]
+name = "pypi"
+url = "https://pypi.org/simple"
+verify_ssl = true
+
+[dev-packages]
+flake8 = "*"
+black = "*"
+mypy = "*"
+isort = "*"
+pytest = "*"
+awscli = "*"
+
+[packages]
+nginx-ec2 = {editable = true,path = "."}
+aws-cdk-aws-ec2 = "*"
+jinja2 = "*"
+pyyaml = "*"
+aws-cdk-aws-elasticloadbalancingv2 = "*"
+
+[requires]
+python_version = "3.7"
+
+[pipenv]
+allow_prereleases = true

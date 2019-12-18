@@ -1,0 +1,38 @@
+#!/bin/sh
+# start deploy
+yum install -y aws-cfn-bootstrap
+
+/opt/aws/bin/cfn-init \
+  --stack {{ stack }} \
+  --resource NginxEc2 \
+  --region {{ env.get('AWS_DEFAULT_REGION') }}
+
+# export aws env values
+export AWS_ACCESS_KEY_ID={{ env.get('AWS_ACCESS_KEY_ID') }}
+export AWS_SECRET_ACCESS_KEY={{ env.get('AWS_SECRET_ACCESS_KEY') }}
+export AWS_DEFAULT_REGION={{ env.get('AWS_DEFAULT_REGION') }}
+
+# install docker
+yum install -y docker
+systemctl enable docker
+systemctl start docker
+
+# pull nginx image
+eval $(aws ecr get-login --no-include-email);
+
+docker pull \
+  {{ env.get('ECR_REGISTRY_IMAGE') }}:{{ env.get('CI_COMMIT_TAG') }}
+
+# run nginx container
+docker run -d \
+  -e TARGET_HOST={{ config.get('nginx_target_host') }} \
+  -e RESOLVER_IP={{ config.get('nginx_resolver_ip') }} \
+  -p 80:80 \
+  --restart unless-stopped \
+  {{ env.get('ECR_REGISTRY_IMAGE') }}:{{ env.get('CI_COMMIT_TAG') }}
+
+# notify cfn
+/opt/aws/bin/cfn-signal -e $? \
+  --stack {{ stack }} \
+  --resource NginxEc2 \
+  --region {{ env.get('AWS_DEFAULT_REGION') }}
